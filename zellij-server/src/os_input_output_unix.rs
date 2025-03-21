@@ -20,7 +20,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io,
-    os::fd::FromRawFd,
+    os::fd::{AsFd, BorrowedFd, FromRawFd, IntoRawFd},
     os::unix::{
         io::{AsRawFd, RawFd},
         process::CommandExt,
@@ -208,6 +208,7 @@ fn handle_openpty(
 
     let mut child = unsafe {
         let cmd = cmd.clone();
+        let pid_secondary_raw_fd = pid_secondary.as_raw_fd();
         let command = &mut Command::new(cmd.command);
         if let Some(current_dir) = cmd.cwd {
             if current_dir.exists() && current_dir.is_dir() {
@@ -223,7 +224,7 @@ fn handle_openpty(
             .args(&cmd.args)
             .env("ZELLIJ_PANE_ID", &format!("{}", terminal_id))
             .pre_exec(move || -> io::Result<()> {
-                if libc::login_tty(pid_secondary) != 0 {
+                if libc::login_tty(pid_secondary_raw_fd) != 0 {
                     panic!("failed to set controlling terminal");
                 }
                 close_fds::close_open_fds(3, &[]);
@@ -239,11 +240,11 @@ fn handle_openpty(
         let exit_status = handle_command_exit(child)
             .with_context(|| err_context(&cmd))
             .fatal();
-        let _ = unistd::close(pid_secondary);
+        drop(pid_secondary);
         quit_cb(PaneId::Terminal(terminal_id), exit_status, cmd);
     });
 
-    Ok((pid_primary, child_id as RawFd))
+    Ok((pid_primary.into_raw_fd(), child_id as RawFd))
 }
 
 /// Spawns a new terminal from the parent terminal with [`termios`](termios::Termios)
@@ -289,6 +290,7 @@ pub(crate) struct UnixPtyBackend {
 /// were written so far (which may be 0). The caller is expected to re-queue
 /// any unwritten remainder.
 fn try_write_to_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     let mut written = 0;
     while written < buf.len() {
         match unistd::write(fd, &buf[written..]) {
@@ -304,7 +306,7 @@ fn try_write_to_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
 
 impl UnixPtyBackend {
     pub fn new() -> Result<Self, io::Error> {
-        let current_termios = termios::tcgetattr(0).ok();
+        let current_termios = termios::tcgetattr(io::stdin().as_fd()).ok();
         if current_termios.is_none() {
             log::warn!("Starting a server without a controlling terminal, using the default termios configuration.");
         }
@@ -409,7 +411,10 @@ impl UnixPtyBackend {
             .with_context(err_context)?
             .get(&terminal_id)
         {
-            Some(Some(fd)) => termios::tcdrain(*fd).with_context(err_context),
+            Some(Some(fd)) => {
+                let fd = unsafe { BorrowedFd::borrow_raw(*fd) };
+                termios::tcdrain(fd).with_context(err_context)
+            },
             _ => Err(anyhow!("could not find raw file descriptor")).with_context(err_context),
         }
     }
